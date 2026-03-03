@@ -1,6 +1,7 @@
 """
 Dynamic Bayesian Network (DBN) — Discrete Variables Only
-with Particle Filtering + Future Prediction + Full DBN Visualization
+with Particle Filtering + Future Prediction + Causal Interventions + 
+Network Pruning + Full DBN Visualization
 
 AIMA (Russell & Norvig) style.
 
@@ -18,6 +19,16 @@ Dependencies:
   E_t | E_{t-1}, W_t, T_t
   U_t | W_t                   (sensor)
   A_t | E_t, W_t              (sensor)
+
+Interventions:
+  Supports causal interventions via do-operator: do(Variable = value)
+  Interventions break incoming causal links and force variable values.
+  Example: do(W=sunny) sets weather to sunny regardless of previous weather.
+
+Network Pruning:
+  Ancestor-based pruning removes irrelevant variables from computation.
+  Only computes ancestors of query + evidence variables.
+  Example: Query P(W|U) doesn't need E or A, saving computation.
 """
 
 import numpy as np
@@ -52,6 +63,13 @@ class DBN:
     prior_cpds:       dict[str, CPD]
     transition_cpds:  dict[str, CPD]
     sensor_cpds:      dict[str, CPD]
+
+@dataclass
+class Intervention:
+    """Causal intervention: do(variable = value) at specific time."""
+    time: int           # when to intervene
+    variable: str       # which variable to intervene on
+    value: Any          # forced value
 
 Particle = dict   # varname -> value
 
@@ -229,34 +247,75 @@ def systematic_resample(particles, weights):
     return new_particles
 
 
-def propagate(particle: Particle, trans_cpds: dict) -> Particle:
+def propagate(particle: Particle, trans_cpds: dict, interventions: dict = None) -> Particle:
+    """Propagate particle forward, applying any interventions (breaks causal links)."""
+    interventions = interventions or {}
     new_p = {}
     for vname, cpd in trans_cpds.items():
-        pv = {}
-        for pn in cpd.parents:
-            pv[pn] = particle[pn[5:]] if pn.startswith('prev_') else new_p[pn]
-        new_p[vname] = cpd.sample_fn(pv)
+        if vname in interventions:
+            # INTERVENTION: force value, break incoming causal edges
+            new_p[vname] = interventions[vname]
+        else:
+            # Normal propagation: sample from CPD given parents
+            pv = {}
+            for pn in cpd.parents:
+                pv[pn] = particle[pn[5:]] if pn.startswith('prev_') else new_p[pn]
+            new_p[vname] = cpd.sample_fn(pv)
     return new_p
 
 
 def particle_filter_with_prediction(dbn: DBN, observations: list[dict],
-                                    evidence_until: int, N: int = 1000):
+                                    evidence_until: int, N: int = 1000,
+                                    interventions: list[Intervention] = None,
+                                    query_vars: set[str] = None,
+                                    enable_pruning: bool = False):
     """
     Run particle filter with reweighting up to `evidence_until` (inclusive),
     then propagate freely (no reweighting) for remaining steps.
+    
+    Interventions: list of Intervention objects specifying do(var=val) at specific times.
+    Interventions break causal links - the intervened variable ignores its parents.
+    
+    Query variables: set of variables we're interested in querying.
+    Enable pruning: if True, prune network to only ancestors of query+evidence variables.
 
-    Returns list of particle sets, one per time step.
+    Returns list of (mode, particles, intervention_info) tuples, one per time step.
     """
+    interventions = interventions or []
+    query_vars = query_vars or set()
+    
+    # Optionally prune the network
+    relevant_vars = None
+    if enable_pruning and query_vars:
+        # Extract evidence variable names from observations
+        evidence_vars = set()
+        for obs in observations:
+            evidence_vars.update(obs.keys())
+        
+        # Prune DBN to only relevant ancestors
+        dbn, relevant_vars = prune_dbn(dbn, evidence_vars, query_vars)
+    
+    # Build intervention lookup: time -> {var: value}
+    intervention_map = defaultdict(dict)
+    for interv in interventions:
+        intervention_map[interv.time][interv.variable] = interv.value
+    
     def sample_prior() -> Particle:
         p = {}
         for vname, cpd in dbn.prior_cpds.items():
             pv = {pn: p[pn] for pn in cpd.parents}
             p[vname] = cpd.sample_fn(pv)
+        # Apply t=0 interventions if any
+        if 0 in intervention_map:
+            p.update(intervention_map[0])
         return p
 
     def weight_particle(particle: Particle, obs: dict) -> float:
         log_w = 0.0
         for oname, oval in obs.items():
+            # Skip if observation variable was pruned
+            if oname not in dbn.sensor_cpds:
+                continue
             cpd = dbn.sensor_cpds[oname]
             pv = {pn: particle[pn] for pn in cpd.parents}
             log_w += cpd.logprob_fn(oval, pv)
@@ -267,7 +326,9 @@ def particle_filter_with_prediction(dbn: DBN, observations: list[dict],
 
     for t, obs in enumerate(observations):
         if t > 0:
-            particles = [propagate(p, dbn.transition_cpds) for p in particles]
+            # Propagate with interventions at this timestep
+            intervs_t = intervention_map.get(t, {})
+            particles = [propagate(p, dbn.transition_cpds, intervs_t) for p in particles]
 
         if t <= evidence_until:
             # Filtered: weight by observation
@@ -280,7 +341,9 @@ def particle_filter_with_prediction(dbn: DBN, observations: list[dict],
             # Prediction: let particles run free
             mode = 'predicted'
 
-        results.append((mode, [dict(p) for p in particles]))
+        # Record intervention info for visualization
+        interv_info = intervention_map.get(t, None)
+        results.append((mode, [dict(p) for p in particles], interv_info))
 
     return results
 
@@ -295,6 +358,98 @@ def marginal(particles: list[Particle], var: str) -> dict:
         counts[p[var]] += 1
     total = len(particles)
     return {k: v / total for k, v in counts.items()}
+
+
+# ─────────────────────────────────────────────────────────────
+# Network Pruning (Ancestor-based)
+# ─────────────────────────────────────────────────────────────
+
+def build_dependency_graph(dbn: DBN) -> dict[str, set[str]]:
+    """
+    Build dependency graph: var -> set of parents (within same time slice).
+    'prev_X' prefix indicates parent from previous time slice.
+    Returns: {variable: {parent1, parent2, ...}}
+    """
+    graph = {}
+    
+    # All variables start with empty parent sets
+    for v in dbn.state_vars + dbn.obs_vars:
+        graph[v.name] = set()
+    
+    # Add edges from transition CPDs
+    for vname, cpd in dbn.transition_cpds.items():
+        for pn in cpd.parents:
+            # Strip 'prev_' prefix for same-variable dependencies
+            parent = pn[5:] if pn.startswith('prev_') else pn
+            graph[vname].add(parent)
+    
+    # Add edges from sensor CPDs
+    for vname, cpd in dbn.sensor_cpds.items():
+        for pn in cpd.parents:
+            parent = pn[5:] if pn.startswith('prev_') else pn
+            graph[vname].add(parent)
+    
+    return graph
+
+
+def find_ancestors(graph: dict[str, set[str]], targets: set[str]) -> set[str]:
+    """
+    Find all ancestors of target variables using DFS.
+    Returns: set of variable names including targets themselves.
+    """
+    ancestors = set()
+    stack = list(targets)
+    
+    while stack:
+        node = stack.pop()
+        if node not in ancestors:
+            ancestors.add(node)
+            # Add parents to explore
+            if node in graph:
+                for parent in graph[node]:
+                    if parent not in ancestors:
+                        stack.append(parent)
+    
+    return ancestors
+
+
+def prune_dbn(dbn: DBN, evidence_vars: set[str], query_vars: set[str]) -> tuple[DBN, set[str]]:
+    """
+    Prune DBN to only include ancestors of evidence and query variables.
+    
+    Returns:
+        - Pruned DBN with only relevant variables
+        - Set of relevant variable names
+    """
+    # Build dependency graph
+    graph = build_dependency_graph(dbn)
+    
+    # Find all ancestors of evidence and query variables
+    relevant_vars = find_ancestors(graph, evidence_vars | query_vars)
+    
+    print(f"\n[Pruning] Evidence vars: {evidence_vars}")
+    print(f"[Pruning] Query vars: {query_vars}")
+    print(f"[Pruning] Relevant vars after ancestral pruning: {relevant_vars}")
+    print(f"[Pruning] Pruned {len(graph) - len(relevant_vars)} of {len(graph)} variables\n")
+    
+    # Filter state and obs variables
+    pruned_state_vars = [v for v in dbn.state_vars if v.name in relevant_vars]
+    pruned_obs_vars = [v for v in dbn.obs_vars if v.name in relevant_vars]
+    
+    # Filter CPDs
+    pruned_prior_cpds = {k: v for k, v in dbn.prior_cpds.items() if k in relevant_vars}
+    pruned_transition_cpds = {k: v for k, v in dbn.transition_cpds.items() if k in relevant_vars}
+    pruned_sensor_cpds = {k: v for k, v in dbn.sensor_cpds.items() if k in relevant_vars}
+    
+    pruned_dbn = DBN(
+        state_vars=pruned_state_vars,
+        obs_vars=pruned_obs_vars,
+        prior_cpds=pruned_prior_cpds,
+        transition_cpds=pruned_transition_cpds,
+        sensor_cpds=pruned_sensor_cpds
+    )
+    
+    return pruned_dbn, relevant_vars
 
 
 # ─────────────────────────────────────────────────────────────
@@ -415,6 +570,10 @@ COLORS = {
 def plot_marginals(results, true_traj, obs_seq, evidence_until, ax_W, ax_T, ax_E):
     T = len(results)
     ts = list(range(T))
+    
+    # Check which variables are actually present in particles (not pruned)
+    sample_particle = results[0][1][0]  # First particle from first timestep
+    available_vars = set(sample_particle.keys())
 
     for var, ax, title in [('W', ax_W, 'Weather  W'),
                             ('T', ax_T, 'Temperature  T'),
@@ -424,11 +583,22 @@ def plot_marginals(results, true_traj, obs_seq, evidence_until, ax_W, ax_T, ax_E
         ax.tick_params(colors='white')
         for spine in ax.spines.values():
             spine.set_edgecolor('#444466')
+        
+        # Check if variable was pruned
+        if var not in available_vars:
+            ax.text(0.5, 0.5, f'{var} - PRUNED\n(not ancestor of query/evidence)',
+                   ha='center', va='center', color='#ff6666',
+                   fontsize=14, fontweight='bold',
+                   transform=ax.transAxes)
+            ax.set_xlim(0, T - 1)
+            ax.set_ylim(0, 1)
+            ax.set_xlabel('Time step', color='#aaaacc', fontsize=8)
+            continue
 
         var_obj = next(v for v in [*dbn.state_vars, *dbn.obs_vars] if v.name == var)
         for val in var_obj.values:
             probs = [marginal(particles, var).get(val, 0.0)
-                     for _, particles in results]
+                     for _, particles, _ in results]
             col = COLORS.get(val, '#cccccc')
             ax.plot(ts, probs, color=col, linewidth=2, label=val)
             ax.fill_between(ts, probs, alpha=0.15, color=col)
@@ -438,6 +608,13 @@ def plot_marginals(results, true_traj, obs_seq, evidence_until, ax_W, ax_T, ax_E
             ax.scatter(t, 1.02, marker='v', s=40,
                        color=COLORS.get(state[var], '#ffffff'),
                        zorder=5, clip_on=False)
+
+        # Mark interventions on this variable
+        for t, (_, _, interv_info) in enumerate(results):
+            if interv_info and var in interv_info:
+                ax.axvline(t, color='#00ff88', linestyle=':', linewidth=2.5, alpha=0.9)
+                ax.text(t, 1.05, f'do({var})', color='#00ff88', fontsize=7, 
+                       ha='center', style='italic', clip_on=False)
 
         # Prediction boundary
         ax.axvline(evidence_until + 0.5, color='#ff6666',
@@ -493,36 +670,71 @@ if __name__ == '__main__':
     T              = 10
     EVIDENCE_UNTIL = 6   # filter up to t=6 inclusive, predict t=7..9
     N_PARTICLES    = 2000
+    
+    # ── Network Pruning Setup ─────────────────────────────────
+    # Enable pruning to only track ancestors of query + evidence vars
+    # Example: If querying W given only U, don't need to track E, T, or A
+    ENABLE_PRUNING = True
+    QUERY_VARS = {'W'}  # Only query Weather
+    # We'll manually filter observations to only include U
+    
+    print("=" * 80)
+    print("DEMONSTRATION: Network Pruning")
+    print("Query: P(W | U)  (Weather given Umbrella)")
+    print("Expected: Should prune E, T, A (not ancestors of W or U)")
+    print("=" * 80)
+
+    # ── Demonstrate Interventional Query ──────────────────────
+    interventions = [
+        Intervention(time=4, variable='W', value='sunny'),
+    ]
 
     dbn = build_weather_dbn()
     true_traj, obs_seq = simulate_dbn(dbn, T)
+    
+    # Filter observations to only include Umbrella (U)
+    # This will trigger pruning of E, T, A
+    obs_seq_filtered = [{'U': obs['U']} for obs in obs_seq]
+    
     results = particle_filter_with_prediction(
-        dbn, obs_seq, evidence_until=EVIDENCE_UNTIL, N=N_PARTICLES)
+        dbn, obs_seq_filtered, evidence_until=EVIDENCE_UNTIL, N=N_PARTICLES,
+        interventions=interventions,
+        query_vars=QUERY_VARS,
+        enable_pruning=ENABLE_PRUNING)
 
     # ── Print table ──────────────────────────────────────────
     print(f"\n{'t':>3}  {'true_W':>8} {'est_W':>10}  "
           f"{'true_T':>6} {'est_T':>8}  "
           f"{'true_E':>6} {'est_E':>8}  "
-          f"{'obs_U':>6} {'obs_A':>8}  mode")
-    print('─' * 95)
+          f"{'obs_U':>6}  mode")
+    print('─' * 80)
 
-    for t, (mode, particles) in enumerate(results):
-        mW = marginal(particles, 'W')
-        mT = marginal(particles, 'T')
-        mE = marginal(particles, 'E')
-        best_W = max(mW, key=mW.get)
-        best_T = max(mT, key=mT.get)
-        best_E = max(mE, key=mE.get)
+    for t, (mode, particles, interv_info) in enumerate(results):
+        # Handle potentially pruned variables
+        mW = marginal(particles, 'W') if 'W' in particles[0] else {}
+        mT = marginal(particles, 'T') if 'T' in particles[0] else {}
+        mE = marginal(particles, 'E') if 'E' in particles[0] else {}
+        
+        best_W = max(mW, key=mW.get) if mW else 'PRUNED'
+        best_T = max(mT, key=mT.get) if mT else 'PRUNED'
+        best_E = max(mE, key=mE.get) if mE else 'PRUNED'
+        
         marker = '  ←' if mode == 'predicted' else ''
+        interv_marker = f'  do({list(interv_info.keys())[0]}={list(interv_info.values())[0]})' if interv_info else ''
         print(f"{t:>3}  {true_traj[t]['W']:>8} {best_W:>10}  "
               f"{true_traj[t]['T']:>6} {best_T:>8}  "
               f"{true_traj[t]['E']:>6} {best_E:>8}  "
-              f"{obs_seq[t]['U']:>6} {obs_seq[t]['A']:>8}  "
-              f"{mode}{marker}")
+              f"{obs_seq[t]['U']:>6}  "
+              f"{mode}{marker}{interv_marker}")
+    
+    print("\n" + "=" * 80)
+    print("Notice: T and E show 'PRUNED' - they weren't computed!")
+    print("This saves computation when only querying W given U.")
+    print("=" * 80)
 
     # ── Plot ─────────────────────────────────────────────────
     fig = plt.figure(figsize=(16, 11), facecolor='#12122a')
-    fig.suptitle('Discrete DBN  ·  Particle Filtering + Prediction',
+    fig.suptitle('Discrete DBN  ·  Particle Filtering + Causal Interventions + Network Pruning',
                  color='white', fontsize=15, fontweight='bold', y=0.98)
 
     gs = gridspec.GridSpec(3, 3, figure=fig,
@@ -538,15 +750,15 @@ if __name__ == '__main__':
 
     visualize_dbn_structure(dbn, ax_struct)
 
-    _, particle_sets = zip(*results)
     plot_marginals(results, true_traj, obs_seq,
                   EVIDENCE_UNTIL, ax_W, ax_T, ax_E)
     plot_observations(obs_seq, ax_obs)
 
-    # Small legend for true-value triangles
+    # Small legend for true-value triangles and interventions
     fig.text(0.54, 0.005,
-             '▾ triangle = true value at that step   '
-             '─ ─  red dashed = prediction boundary',
+             '▾ triangle = true value   '
+             '─ ─  red dashed = prediction boundary   '
+             '⋮  green dotted = intervention do(·)',
              color='#aaaacc', fontsize=8, ha='center')
 
     plt.savefig('dbn_particle_filter.png',
